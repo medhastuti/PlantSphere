@@ -1,0 +1,263 @@
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>   // For ADS1115
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <time.h>
+#include <DHT.h>
+
+#define WIFI_SSID "DHX9056"
+#define WIFI_PASSWORD "z1x2c3v4"
+
+#define API_KEY "AIzaSyBvoQsg7FZMl7nrRpqyApxPbpotoPXbGB0"
+#define DATABASE_URL "https://plantsphere-b13e7-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL "irrigation@gmail.com"
+#define USER_PASSWORD "123456"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+#define RELAY_PIN D1
+#define DHTPIN D6        // Choose any free GPIO pin
+#define DHTTYPE DHT11    // Change to DHT22 if you have that sensor
+DHT dht(DHTPIN, DHTTYPE);
+
+// *** ADS1115 ***
+Adafruit_ADS1115 ads;   
+// Soil sensor connected to ADS1115 AIN1
+#define SOIL_CHANNEL 0
+#define SOLAR_CHANNEL 1   // ADS1115 A1 for solar voltage    
+#define WATER_CHANNEL 2   // ADS1115 A2 for water sensor
+#define LDR_CHANNEL 3   // ADS1115 A3 for LDR sensor
+
+unsigned long lastSoilUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+unsigned long lastOnlinePing = 0;
+
+bool manualPumpON = false;
+bool autoPumpRunning = false;
+unsigned long autoPumpStart = 0;
+
+int DRY_LEVEL = 700;
+
+/* ------------ NTP TIME FUNCTION -------------- */
+String getTimeString() {
+  time_t now = time(nullptr);
+  struct tm *timeinfo = localtime(&now);
+
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+  return String(buffer);
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  /* ------------ I2C for ADS1115 ------------ */
+  Wire.begin(D2, D5);   // SDA = D2, SCL = D5
+  ads.begin();
+
+  /* ------------ WiFi ------------ */
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+
+  /* ------------ NTP Time Setup ------------ */
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  Serial.println("Waiting for NTP time...");
+  while (time(nullptr) < 100000) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nNTP Time Synced!");
+
+  /* ------------ Firebase Setup ------------ */
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Firebase.setString(fbdo, "/deviceStatus/nodemcu/state", "online");
+  Firebase.setString(fbdo, "/deviceStatus/nodemcu/lastSeen", getTimeString());
+
+  Serial.println("READY");
+}
+
+void loop() {
+
+  // ---------------- ONLINE HEARTBEAT ----------------
+  if (millis() - lastOnlinePing > 1000) {
+
+    time_t now = time(nullptr);
+
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      Firebase.setString(fbdo, "/deviceStatus/nodemcu/state", "online");
+      Firebase.setInt(fbdo, "/deviceStatus/nodemcu/lastSeen", (long)now);
+    } else {
+      Firebase.setString(fbdo, "/deviceStatus/nodemcu/state", "offline");
+      Firebase.setInt(fbdo, "/deviceStatus/nodemcu/lastSeen", (long)now);
+    }
+
+    lastOnlinePing = millis();
+  }
+
+  // ---------------- USER MANUAL CONTROL ----------------
+  if (Firebase.getString(fbdo, "/pump/state")) {
+    String cmd = fbdo.stringData();
+    cmd.trim();
+    cmd.toLowerCase();
+
+    if (cmd == "on") {
+      manualPumpON = true;
+      autoPumpRunning = false;
+      digitalWrite(RELAY_PIN, LOW);
+    }
+    else {
+      manualPumpON = false;
+      if (!autoPumpRunning)
+        digitalWrite(RELAY_PIN, HIGH);
+    }
+  }
+
+  // ---------------- SOIL SENSOR FROM ADS1115 ----------------
+  if (millis() - lastSoilUpdate > 1500) {
+
+    int16_t rawValue = ads.readADC_SingleEnded(SOIL_CHANNEL);
+    int soil = map(rawValue, 0, 20000, 0, 1023);   // Convert to 0–1023 like NodeMCU A0
+
+    Firebase.setInt(fbdo, "/soil/value", soil);
+
+    Serial.print("ADS Soil Raw: ");
+    Serial.print(rawValue);
+    Serial.print("  |  Mapped: ");
+    Serial.println(soil);
+
+    if (!manualPumpON && !autoPumpRunning && soil > DRY_LEVEL) {
+      autoPumpRunning = true;
+      autoPumpStart = millis();
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("AUTO MODE START");
+    }
+
+    lastSoilUpdate = millis();
+  }
+
+  // ---------------- SOLAR VOLTAGE SENSOR (A1) ----------------
+  // Exact divider for 30k/7.5k voltage sensor module:
+  const float SOLAR_DIVIDER_FACTOR = (30.0 + 7.5) / 7.5;  // = 5.0 exactly
+
+  // ADS1115 gain = GAIN_ONE → resolution per bit:
+  const float ADS_LSB = 4.096 / 32768.0;  // 0.000125V per bit
+
+  // Read ADS channel A1
+  int16_t rawSolar = ads.readADC_SingleEnded(SOLAR_CHANNEL);
+
+  // Convert raw to ADC voltage (accurate)
+  float adcVoltage = rawSolar * ADS_LSB;
+
+  // Calibration factor (use 1.0 by default; adjust after multimeter test)
+  float calibFactor = 1.00;
+
+  // Compute actual solar panel voltage
+  float solarVoltage = adcVoltage * SOLAR_DIVIDER_FACTOR * calibFactor;
+
+  // Soft rounding for Firebase
+  float solarRounded = float(int(solarVoltage * 100)) / 100.0;
+
+  // Clamp to safe range
+  if (solarRounded < 0.0) solarRounded = 0.0;
+  if (solarRounded > 50.0) solarRounded = 50.0; // solar shouldn't exceed this
+
+  Firebase.setFloat(fbdo, "/solar/voltage", solarRounded);
+
+  // Debug serial print
+  Serial.print("rawSolar: "); Serial.print(rawSolar);
+  Serial.print("  adcV: "); Serial.print(adcVoltage, 5);
+  Serial.print("  solarV: "); Serial.println(solarRounded, 3);
+
+  // ---------------- WATER SENSOR (A2) — analogRead style ----------------
+
+  // Read ADS1115 A2 (0–32767)
+  int16_t rawWater = ads.readADC_SingleEnded(WATER_CHANNEL);
+
+  // Convert ADS 15-bit to 10-bit (like analogRead 0–1023)
+  int waterValue = map(rawWater, 0, 20000, 0, 1023);
+
+  // Clamp for safety
+  if (waterValue < 0) waterValue = 0;
+  if (waterValue > 1023) waterValue = 1023;
+
+  // Send to Firebase
+  Firebase.setInt(fbdo, "/water/value", waterValue);
+
+  // Debug
+  Serial.print("rawWater: "); Serial.print(rawWater);
+  Serial.print("  waterValue(0-1023): "); Serial.println(waterValue);
+
+  // ---------------- LDR SENSOR (A3) ----------------
+  int16_t rawLDR = ads.readADC_SingleEnded(LDR_CHANNEL);
+
+  // Convert raw 0–32767 to a readable 0–1023 brightness scale
+  int ldrValue = map(rawLDR, 0, 20000, 1023, 0);  
+
+  // Clamp values
+  if (ldrValue < 0) ldrValue = 0;
+  if (ldrValue > 1023) ldrValue = 1023;
+
+  // Upload to Firebase
+  Firebase.setInt(fbdo, "/ldr/value", ldrValue);
+
+  // Debug print
+  Serial.print("LDR Raw: ");
+  Serial.print(rawLDR);
+  Serial.print("  |  Brightness: ");
+  Serial.println(ldrValue);
+
+  // ---------------- DHT SENSOR (TEMP + HUMIDITY) ----------------
+  float h = dht.readHumidity();
+  float t = dht.readTemperature(); // °C
+
+  // Check for valid data
+  if (isnan(h) || isnan(t)) {
+      Serial.println("Failed to read from DHT sensor!");
+  } else {
+      // Send to Firebase
+      Firebase.setFloat(fbdo, "/environment/temperature", t);
+      Firebase.setFloat(fbdo, "/environment/humidity", h);
+
+      // Debug
+      Serial.print("Temp: "); Serial.print(t);
+      Serial.print(" °C  |  Humidity: "); Serial.print(h);
+      Serial.println(" %");
+  }
+
+
+  // ---------------- AUTO STOP ----------------
+  if (autoPumpRunning && millis() - autoPumpStart >= 5000) {
+    autoPumpRunning = false;
+    Serial.println("AUTO STOP");
+
+    if (!manualPumpON)
+      digitalWrite(RELAY_PIN, HIGH);
+  }
+
+  // ---------------- REAL PUMP STATUS ----------------
+  if (millis() - lastStatusUpdate > 1500) {
+    String realStatus = (digitalRead(RELAY_PIN) == LOW) ? "on" : "off";
+    Firebase.setString(fbdo, "/pump/status", realStatus);
+    lastStatusUpdate = millis();
+  }
+}
