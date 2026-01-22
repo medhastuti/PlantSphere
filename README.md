@@ -23,7 +23,7 @@ PlantSphere integrates IoT hardware with a web application to monitor plant heal
 
 ### **Hardware**
 - NodeMCU (ESP8266)
-- Sensors: Soil Moisture Sensor, DHT11 (Temperature & Humidity), Solar Panel, Voltage Sensor, Water Level Sensor, Pump, Relay
+- Sensors: Soil Moisture Sensor, DHT11 (Temperature & Humidity), Solar Panel, Voltage Sensor, Water Level Sensor, Pump, Relay, LDR Sensor
 
 ### **Frontend**
 - HTML, CSS, JavaScript
